@@ -12,6 +12,8 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "llvm/Support/raw_ostream.h"
+
 
 #include "llvm/Transforms/IPO/PassManagerBuilder.h"
 #include "llvm-c/Transforms/PassManagerBuilder.h"
@@ -41,6 +43,10 @@ RunBBVectorization("vectorize-slp-aggressive",
                     cl::desc("Run the BB vectorization passes"));
 
 static cl::opt<bool>
+RunBBVectorizationGlobal("vectorize-slp-aggressive-global",
+                         cl::desc("Run the global BB vectorization passes"));
+
+static cl::opt<bool>
 UseGVNAfterVectorization("use-gvn-after-vectorization",
   cl::init(false), cl::Hidden,
   cl::desc("Run GVN instead of Early CSE after vectorization passes"));
@@ -58,6 +64,7 @@ PassManagerBuilder::PassManagerBuilder() {
     DisableUnitAtATime = false;
     DisableUnrollLoops = false;
     BBVectorize = RunBBVectorization;
+    BBVectorizeGlobal = RunBBVectorizationGlobal;
     SLPVectorize = RunSLPVectorization;
     LoopVectorize = RunLoopVectorization;
 }
@@ -218,6 +225,19 @@ void PassManagerBuilder::populateModulePassManager(PassManagerBase &MPM) {
 
   if (BBVectorize) {
     MPM.add(createBBVectorizePass());
+    MPM.add(createInstructionCombiningPass());
+    if (OptLevel > 1 && UseGVNAfterVectorization)
+      MPM.add(createGVNPass());                   // Remove redundancies
+    else
+      MPM.add(createEarlyCSEPass());              // Catch trivial redundancies
+
+    // BBVectorize may have significantly shortened a loop body; unroll again.
+    if (!DisableUnrollLoops)
+      MPM.add(createLoopUnrollPass());
+  }
+
+  if (BBVectorizeGlobal) {
+    MPM.add(createBBVectorizeGlobalPass());
     MPM.add(createInstructionCombiningPass());
     if (OptLevel > 1 && UseGVNAfterVectorization)
       MPM.add(createGVNPass());                   // Remove redundancies

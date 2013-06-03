@@ -1,4 +1,4 @@
-//===- BBVectorize.cpp - A Basic-Block Vectorizer -------------------------===//
+//===- BBVectorizeGlobal.cpp - A Basic-Block Vectorizer -------------------===//
 //
 //                     The LLVM Compiler Infrastructure
 //
@@ -7,14 +7,13 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// This file implements a basic-block vectorization pass. The algorithm was
-// inspired by that used by the Vienna MAP Vectorizor by Franchetti and Kral,
-// et al. It works by looking for chains of pairable operations and then
-// pairing them.
+// This file implements a basic-block vectorization pass. This
+// algorithm is based on "A Compiler Framework for Extracting
+// Superword Level Parallelism" by Liu et. al. (PLDI'12)
 //
 //===----------------------------------------------------------------------===//
 
-#define BBV_NAME "bb-vectorize"
+#define BBV_NAME "bb-vectorize-global"
 #define DEBUG_TYPE BBV_NAME
 #include "llvm/Transforms/Vectorize.h"
 #include "llvm/ADT/DenseMap.h"
@@ -51,152 +50,152 @@
 using namespace llvm;
 
 static cl::opt<bool>
-IgnoreTargetInfo("bb-vectorize-ignore-target-info",  cl::init(false),
+IgnoreTargetInfo("bb-vectorize-global-ignore-target-info",  cl::init(false),
   cl::Hidden, cl::desc("Ignore target information"));
 
 static cl::opt<unsigned>
-ReqChainDepth("bb-vectorize-req-chain-depth", cl::init(6), cl::Hidden,
+ReqChainDepth("bb-vectorize-global-req-chain-depth", cl::init(6), cl::Hidden,
   cl::desc("The required chain depth for vectorization"));
 
 static cl::opt<bool>
-UseChainDepthWithTI("bb-vectorize-use-chain-depth",  cl::init(false),
+UseChainDepthWithTI("bb-vectorize-global-use-chain-depth",  cl::init(false),
   cl::Hidden, cl::desc("Use the chain depth requirement with"
                        " target information"));
 
 static cl::opt<unsigned>
-SearchLimit("bb-vectorize-search-limit", cl::init(400), cl::Hidden,
+SearchLimit("bb-vectorize-global-search-limit", cl::init(400), cl::Hidden,
   cl::desc("The maximum search distance for instruction pairs"));
 
 static cl::opt<bool>
-SplatBreaksChain("bb-vectorize-splat-breaks-chain", cl::init(false), cl::Hidden,
+SplatBreaksChain("bb-vectorize-global-splat-breaks-chain", cl::init(false), cl::Hidden,
   cl::desc("Replicating one element to a pair breaks the chain"));
 
 static cl::opt<unsigned>
-VectorBits("bb-vectorize-vector-bits", cl::init(128), cl::Hidden,
+VectorBits("bb-vectorize-global-vector-bits", cl::init(128), cl::Hidden,
   cl::desc("The size of the native vector registers"));
 
 static cl::opt<unsigned>
-MaxIter("bb-vectorize-max-iter", cl::init(0), cl::Hidden,
+MaxIter("bb-vectorize-global-max-iter", cl::init(0), cl::Hidden,
   cl::desc("The maximum number of pairing iterations"));
 
 static cl::opt<bool>
-Pow2LenOnly("bb-vectorize-pow2-len-only", cl::init(false), cl::Hidden,
+Pow2LenOnly("bb-vectorize-global-pow2-len-only", cl::init(false), cl::Hidden,
   cl::desc("Don't try to form non-2^n-length vectors"));
 
 static cl::opt<unsigned>
-MaxInsts("bb-vectorize-max-instr-per-group", cl::init(500), cl::Hidden,
+MaxInsts("bb-vectorize-global-max-instr-per-group", cl::init(500), cl::Hidden,
   cl::desc("The maximum number of pairable instructions per group"));
 
 static cl::opt<unsigned>
-MaxPairs("bb-vectorize-max-pairs-per-group", cl::init(3000), cl::Hidden,
+MaxPairs("bb-vectorize-global-max-pairs-per-group", cl::init(3000), cl::Hidden,
   cl::desc("The maximum number of candidate instruction pairs per group"));
 
 static cl::opt<unsigned>
-MaxCandPairsForCycleCheck("bb-vectorize-max-cycle-check-pairs", cl::init(200),
+MaxCandPairsForCycleCheck("bb-vectorize-global-max-cycle-check-pairs", cl::init(200),
   cl::Hidden, cl::desc("The maximum number of candidate pairs with which to use"
                        " a full cycle check"));
 
 static cl::opt<bool>
-NoBools("bb-vectorize-no-bools", cl::init(false), cl::Hidden,
+NoBools("bb-vectorize-global-no-bools", cl::init(false), cl::Hidden,
   cl::desc("Don't try to vectorize boolean (i1) values"));
 
 static cl::opt<bool>
-NoInts("bb-vectorize-no-ints", cl::init(false), cl::Hidden,
+NoInts("bb-vectorize-global-no-ints", cl::init(false), cl::Hidden,
   cl::desc("Don't try to vectorize integer values"));
 
 static cl::opt<bool>
-NoFloats("bb-vectorize-no-floats", cl::init(false), cl::Hidden,
+NoFloats("bb-vectorize-global-no-floats", cl::init(false), cl::Hidden,
   cl::desc("Don't try to vectorize floating-point values"));
 
 // FIXME: This should default to false once pointer vector support works.
 static cl::opt<bool>
-NoPointers("bb-vectorize-no-pointers", cl::init(/*false*/ true), cl::Hidden,
+NoPointers("bb-vectorize-global-no-pointers", cl::init(/*false*/ true), cl::Hidden,
   cl::desc("Don't try to vectorize pointer values"));
 
 static cl::opt<bool>
-NoCasts("bb-vectorize-no-casts", cl::init(false), cl::Hidden,
+NoCasts("bb-vectorize-global-no-casts", cl::init(false), cl::Hidden,
   cl::desc("Don't try to vectorize casting (conversion) operations"));
 
 static cl::opt<bool>
-NoMath("bb-vectorize-no-math", cl::init(false), cl::Hidden,
+NoMath("bb-vectorize-global-no-math", cl::init(false), cl::Hidden,
   cl::desc("Don't try to vectorize floating-point math intrinsics"));
 
 static cl::opt<bool>
-NoFMA("bb-vectorize-no-fma", cl::init(false), cl::Hidden,
+NoFMA("bb-vectorize-global-no-fma", cl::init(false), cl::Hidden,
   cl::desc("Don't try to vectorize the fused-multiply-add intrinsic"));
 
 static cl::opt<bool>
-NoSelect("bb-vectorize-no-select", cl::init(false), cl::Hidden,
+NoSelect("bb-vectorize-global-no-select", cl::init(false), cl::Hidden,
   cl::desc("Don't try to vectorize select instructions"));
 
 static cl::opt<bool>
-NoCmp("bb-vectorize-no-cmp", cl::init(false), cl::Hidden,
+NoCmp("bb-vectorize-global-no-cmp", cl::init(false), cl::Hidden,
   cl::desc("Don't try to vectorize comparison instructions"));
 
 static cl::opt<bool>
-NoGEP("bb-vectorize-no-gep", cl::init(false), cl::Hidden,
+NoGEP("bb-vectorize-global-no-gep", cl::init(false), cl::Hidden,
   cl::desc("Don't try to vectorize getelementptr instructions"));
 
 static cl::opt<bool>
-NoMemOps("bb-vectorize-no-mem-ops", cl::init(false), cl::Hidden,
+NoMemOps("bb-vectorize-global-no-mem-ops", cl::init(false), cl::Hidden,
   cl::desc("Don't try to vectorize loads and stores"));
 
 static cl::opt<bool>
-AlignedOnly("bb-vectorize-aligned-only", cl::init(false), cl::Hidden,
+AlignedOnly("bb-vectorize-global-aligned-only", cl::init(false), cl::Hidden,
   cl::desc("Only generate aligned loads and stores"));
 
 static cl::opt<bool>
-NoMemOpBoost("bb-vectorize-no-mem-op-boost",
+NoMemOpBoost("bb-vectorize-global-no-mem-op-boost",
   cl::init(false), cl::Hidden,
   cl::desc("Don't boost the chain-depth contribution of loads and stores"));
 
 static cl::opt<bool>
-FastDep("bb-vectorize-fast-dep", cl::init(false), cl::Hidden,
+FastDep("bb-vectorize-global-fast-dep", cl::init(false), cl::Hidden,
   cl::desc("Use a fast instruction dependency analysis"));
 
 #ifndef NDEBUG
 static cl::opt<bool>
-DebugInstructionExamination("bb-vectorize-debug-instruction-examination",
+DebugInstructionExamination("bb-vectorize-global-debug-instruction-examination",
   cl::init(false), cl::Hidden,
   cl::desc("When debugging is enabled, output information on the"
            " instruction-examination process"));
 static cl::opt<bool>
-DebugCandidateSelection("bb-vectorize-debug-candidate-selection",
+DebugCandidateSelection("bb-vectorize-global-debug-candidate-selection",
   cl::init(false), cl::Hidden,
   cl::desc("When debugging is enabled, output information on the"
            " candidate-selection process"));
 static cl::opt<bool>
-DebugPairSelection("bb-vectorize-debug-pair-selection",
+DebugPairSelection("bb-vectorize-global-debug-pair-selection",
   cl::init(false), cl::Hidden,
   cl::desc("When debugging is enabled, output information on the"
            " pair-selection process"));
 static cl::opt<bool>
-DebugCycleCheck("bb-vectorize-debug-cycle-check",
+DebugCycleCheck("bb-vectorize-global-debug-cycle-check",
   cl::init(false), cl::Hidden,
   cl::desc("When debugging is enabled, output information on the"
            " cycle-checking process"));
 
 static cl::opt<bool>
-PrintAfterEveryPair("bb-vectorize-debug-print-after-every-pair",
+PrintAfterEveryPair("bb-vectorize-global-debug-print-after-every-pair",
   cl::init(false), cl::Hidden,
   cl::desc("When debugging is enabled, dump the basic block after"
            " every pair is fused"));
 #endif
 
-STATISTIC(NumFusedOps, "Number of operations fused by bb-vectorize");
+STATISTIC(NumFusedOpsGlobal, "Number of operations fused by bb-vectorize-global");
 
 namespace {
-  struct BBVectorize : public BasicBlockPass {
+  struct BBVectorizeGlobal : public BasicBlockPass {
     static char ID; // Pass identification, replacement for typeid
 
-    const VectorizeConfig Config;
+    const VectorizeConfigGlobal Config;
 
-    BBVectorize(const VectorizeConfig &C = VectorizeConfig())
+    BBVectorizeGlobal(const VectorizeConfigGlobal &C = VectorizeConfigGlobal())
       : BasicBlockPass(ID), Config(C) {
-      initializeBBVectorizePass(*PassRegistry::getPassRegistry());
+      initializeBBVectorizeGlobalPass(*PassRegistry::getPassRegistry());
     }
 
-    BBVectorize(Pass *P, const VectorizeConfig &C)
+    BBVectorizeGlobal(Pass *P, const VectorizeConfigGlobal &C)
       : BasicBlockPass(ID), Config(C) {
       AA = &P->getAnalysis<AliasAnalysis>();
       DT = &P->getAnalysis<DominatorTree>();
@@ -210,6 +209,8 @@ namespace {
     typedef std::pair<ValuePair, size_t> ValuePairWithDepth;
     typedef std::pair<ValuePair, ValuePair> VPPair; // A ValuePair pair
     typedef std::pair<VPPair, unsigned> VPPairWithType;
+    typedef std::map<VPPair, std::vector<VPPair> > VPGraph;
+    typedef std::pair<ValuePair, double> VPairWithWeight;
 
     AliasAnalysis *AA;
     DominatorTree *DT;
@@ -236,6 +237,28 @@ namespace {
       PairConnectionSwap,
       PairConnectionSplat
     };
+
+
+    bool instructionsOverlap(const ValuePair &left, const ValuePair &right);
+    void constructVariablePack(
+             DenseSet<ValuePair> &CandidatePairsSet,
+             VPGraph &VariablePackGraph);
+    void constructStatementGrouping(DenseSet<ValuePair> &CandidatePairsSet,
+                                    VPGraph &VariablePackGraph,
+                                    DenseSet<VPairWithWeight> &StatementGroupingEdges);
+    unsigned processAuxGraph(VPGraph &AuxGraph);
+
+    void eraseAndRecalculate(ValuePair &ChosenPair,
+                             VPGraph &VariablePackGraph,
+                             VPGraph &OriginalVarPackGraph,
+                             DenseSet<VPairWithWeight> &StatementGroupingEdges,
+                             DenseSet<ValuePair> &CandidatePairsSet);
+    void createAuxGraph(ValuePair &Pair, VPGraph &AuxGraph, VPGraph &VariablePackGraph);
+    void updateStatementGrouping(VPGraph &VariablePackGraph,
+                                 VPGraph &OriginalVarPackGraph,
+                                 DenseSet<VPairWithWeight> &StatementGroupingEdges);
+
+
 
     void computeConnectedPairs(
              DenseMap<Value *, std::vector<Value *> > &CandidatePairs,
@@ -687,7 +710,7 @@ namespace {
 
   // This function implements one vectorization iteration on the provided
   // basic block. It returns true if the block is changed.
-  bool BBVectorize::vectorizePairs(BasicBlock &BB, bool NonPow2Len) {
+  bool BBVectorizeGlobal::vectorizePairs(BasicBlock &BB, bool NonPow2Len) {
     bool ShouldContinue;
     BasicBlock::iterator Start = BB.getFirstInsertionPt();
 
@@ -696,109 +719,107 @@ namespace {
     DenseSet<ValuePair> AllFixedOrderPairs;
     DenseMap<VPPair, unsigned> AllPairConnectionTypes;
     DenseMap<ValuePair, std::vector<ValuePair> > AllConnectedPairs,
-                                                 AllConnectedPairDeps;
+      AllConnectedPairDeps;
 
-    do {
-      std::vector<Value *> PairableInsts;
-      DenseMap<Value *, std::vector<Value *> > CandidatePairs;
-      DenseSet<ValuePair> FixedOrderPairs;
-      DenseMap<ValuePair, int> CandidatePairCostSavings;
-      ShouldContinue = getCandidatePairs(BB, Start, CandidatePairs,
-                                         FixedOrderPairs,
-                                         CandidatePairCostSavings,
-                                         PairableInsts, NonPow2Len);
-      if (PairableInsts.empty()) continue;
+    std::vector<Value *> PairableInsts;
+    DenseMap<Value *, std::vector<Value *> > CandidatePairs;
+    DenseSet<ValuePair> FixedOrderPairs;
+    DenseMap<ValuePair, int> CandidatePairCostSavings;
+    ShouldContinue = getCandidatePairs(BB, Start, CandidatePairs,
+                                       FixedOrderPairs,
+                                       CandidatePairCostSavings,
+                                       PairableInsts, NonPow2Len);
+    if (PairableInsts.empty()) return false;
 
-      // Build the candidate pair set for faster lookups.
-      DenseSet<ValuePair> CandidatePairsSet;
-      for (DenseMap<Value *, std::vector<Value *> >::iterator I =
+    // Build the candidate pair set for faster lookups.
+    DenseSet<ValuePair> CandidatePairsSet;
+    for (DenseMap<Value *, std::vector<Value *> >::iterator I =
            CandidatePairs.begin(), E = CandidatePairs.end(); I != E; ++I)
-        for (std::vector<Value *>::iterator J = I->second.begin(),
+      for (std::vector<Value *>::iterator J = I->second.begin(),
              JE = I->second.end(); J != JE; ++J)
-          CandidatePairsSet.insert(ValuePair(I->first, *J));
+        CandidatePairsSet.insert(ValuePair(I->first, *J));
 
-      // Now we have a map of all of the pairable instructions and we need to
-      // select the best possible pairing. A good pairing is one such that the
-      // users of the pair are also paired. This defines a (directed) forest
-      // over the pairs such that two pairs are connected iff the second pair
-      // uses the first.
+    // Now we have a map of all of the pairable instructions and we need to
+    // select the best possible pairing. A good pairing is one such that the
+    // users of the pair are also paired. This defines a (directed) forest
+    // over the pairs such that two pairs are connected iff the second pair
+    // uses the first.
 
-      // Note that it only matters that both members of the second pair use some
-      // element of the first pair (to allow for splatting).
+    // Note that it only matters that both members of the second pair use some
+    // element of the first pair (to allow for splatting).
 
-      DenseMap<ValuePair, std::vector<ValuePair> > ConnectedPairs,
-                                                   ConnectedPairDeps;
-      DenseMap<VPPair, unsigned> PairConnectionTypes;
-      computeConnectedPairs(CandidatePairs, CandidatePairsSet,
-                            PairableInsts, ConnectedPairs, PairConnectionTypes);
-      if (ConnectedPairs.empty()) continue;
+    DenseMap<ValuePair, std::vector<ValuePair> > ConnectedPairs,
+      ConnectedPairDeps;
+    DenseMap<VPPair, unsigned> PairConnectionTypes;
+    computeConnectedPairs(CandidatePairs, CandidatePairsSet,
+                          PairableInsts, ConnectedPairs, PairConnectionTypes);
+    if (ConnectedPairs.empty()) return false;
 
-      for (DenseMap<ValuePair, std::vector<ValuePair> >::iterator
+    for (DenseMap<ValuePair, std::vector<ValuePair> >::iterator
            I = ConnectedPairs.begin(), IE = ConnectedPairs.end();
-           I != IE; ++I)
-        for (std::vector<ValuePair>::iterator J = I->second.begin(),
+         I != IE; ++I)
+      for (std::vector<ValuePair>::iterator J = I->second.begin(),
              JE = I->second.end(); J != JE; ++J)
-          ConnectedPairDeps[*J].push_back(I->first);
+        ConnectedPairDeps[*J].push_back(I->first);
 
-      // Build the pairable-instruction dependency map
-      DenseSet<ValuePair> PairableInstUsers;
-      buildDepMap(BB, CandidatePairs, PairableInsts, PairableInstUsers);
+    // Build the pairable-instruction dependency map
+    DenseSet<ValuePair> PairableInstUsers;
+    buildDepMap(BB, CandidatePairs, PairableInsts, PairableInstUsers);
 
-      // There is now a graph of the connected pairs. For each variable, pick
-      // the pairing with the largest dag meeting the depth requirement on at
-      // least one branch. Then select all pairings that are part of that dag
-      // and remove them from the list of available pairings and pairable
-      // variables.
+    // There is now a graph of the connected pairs. For each variable, pick
+    // the pairing with the largest dag meeting the depth requirement on at
+    // least one branch. Then select all pairings that are part of that dag
+    // and remove them from the list of available pairings and pairable
+    // variables.
 
-      DenseMap<Value *, Value *> ChosenPairs;
-      choosePairs(CandidatePairs, CandidatePairsSet,
-        CandidatePairCostSavings,
-        PairableInsts, FixedOrderPairs, PairConnectionTypes,
-        ConnectedPairs, ConnectedPairDeps,
-        PairableInstUsers, ChosenPairs);
+    DenseMap<Value *, Value *> ChosenPairs;
+    choosePairs(CandidatePairs, CandidatePairsSet,
+                CandidatePairCostSavings,
+                PairableInsts, FixedOrderPairs, PairConnectionTypes,
+                ConnectedPairs, ConnectedPairDeps,
+                PairableInstUsers, ChosenPairs);
 
-      if (ChosenPairs.empty()) continue;
-      AllPairableInsts.insert(AllPairableInsts.end(), PairableInsts.begin(),
-                              PairableInsts.end());
-      AllChosenPairs.insert(ChosenPairs.begin(), ChosenPairs.end());
+    if (ChosenPairs.empty()) return false;
+    AllPairableInsts.insert(AllPairableInsts.end(), PairableInsts.begin(),
+                            PairableInsts.end());
+    AllChosenPairs.insert(ChosenPairs.begin(), ChosenPairs.end());
 
-      // Only for the chosen pairs, propagate information on fixed-order pairs,
-      // pair connections, and their types to the data structures used by the
-      // pair fusion procedures.
-      for (DenseMap<Value *, Value *>::iterator I = ChosenPairs.begin(),
+    // Only for the chosen pairs, propagate information on fixed-order pairs,
+    // pair connections, and their types to the data structures used by the
+    // pair fusion procedures.
+    for (DenseMap<Value *, Value *>::iterator I = ChosenPairs.begin(),
            IE = ChosenPairs.end(); I != IE; ++I) {
-        if (FixedOrderPairs.count(*I))
-          AllFixedOrderPairs.insert(*I);
-        else if (FixedOrderPairs.count(ValuePair(I->second, I->first)))
-          AllFixedOrderPairs.insert(ValuePair(I->second, I->first));
+      if (FixedOrderPairs.count(*I))
+        AllFixedOrderPairs.insert(*I);
+      else if (FixedOrderPairs.count(ValuePair(I->second, I->first)))
+        AllFixedOrderPairs.insert(ValuePair(I->second, I->first));
 
-        for (DenseMap<Value *, Value *>::iterator J = ChosenPairs.begin();
-             J != IE; ++J) {
-          DenseMap<VPPair, unsigned>::iterator K =
-            PairConnectionTypes.find(VPPair(*I, *J));
-          if (K != PairConnectionTypes.end()) {
+      for (DenseMap<Value *, Value *>::iterator J = ChosenPairs.begin();
+           J != IE; ++J) {
+        DenseMap<VPPair, unsigned>::iterator K =
+          PairConnectionTypes.find(VPPair(*I, *J));
+        if (K != PairConnectionTypes.end()) {
+          AllPairConnectionTypes.insert(*K);
+        } else {
+          K = PairConnectionTypes.find(VPPair(*J, *I));
+          if (K != PairConnectionTypes.end())
             AllPairConnectionTypes.insert(*K);
-          } else {
-            K = PairConnectionTypes.find(VPPair(*J, *I));
-            if (K != PairConnectionTypes.end())
-              AllPairConnectionTypes.insert(*K);
-          }
         }
       }
+    }
 
-      for (DenseMap<ValuePair, std::vector<ValuePair> >::iterator
+    for (DenseMap<ValuePair, std::vector<ValuePair> >::iterator
            I = ConnectedPairs.begin(), IE = ConnectedPairs.end();
-           I != IE; ++I)
-        for (std::vector<ValuePair>::iterator J = I->second.begin(),
-          JE = I->second.end(); J != JE; ++J)
-          if (AllPairConnectionTypes.count(VPPair(I->first, *J))) {
-            AllConnectedPairs[I->first].push_back(*J);
-            AllConnectedPairDeps[*J].push_back(I->first);
-          }
-    } while (ShouldContinue);
+         I != IE; ++I)
+      for (std::vector<ValuePair>::iterator J = I->second.begin(),
+             JE = I->second.end(); J != JE; ++J)
+        if (AllPairConnectionTypes.count(VPPair(I->first, *J))) {
+          AllConnectedPairs[I->first].push_back(*J);
+          AllConnectedPairDeps[*J].push_back(I->first);
+        }
 
     if (AllChosenPairs.empty()) return false;
-    NumFusedOps += AllChosenPairs.size();
+    NumFusedOpsGlobal += AllChosenPairs.size();
 
     // errs() << "Dumping inputs to fuseChosenPairs ****************************\n";
 
@@ -849,10 +870,339 @@ namespace {
     return true;
   }
 
+
+
+
+
+  // bool BBVectorizeGlobal::vectorizePairs(BasicBlock &BB, bool NonPow2Len) {
+  //   bool ShouldContinue;
+  //   BasicBlock::iterator Start = BB.getFirstInsertionPt();
+
+  //   std::vector<Value *> AllPairableInsts;
+  //   DenseMap<Value *, Value *> AllChosenPairs;
+  //   DenseSet<ValuePair> AllFixedOrderPairs;
+  //   DenseMap<VPPair, unsigned> AllPairConnectionTypes;
+  //   DenseMap<ValuePair, std::vector<ValuePair> > AllConnectedPairs,
+  //                                                AllConnectedPairDeps;
+
+  //   // Step 1: Identify candidate statement group set
+
+  //   std::vector<Value *> PairableInsts;
+  //   DenseMap<Value *, std::vector<Value *> > CandidatePairs;
+  //   DenseSet<ValuePair> FixedOrderPairs;
+  //   DenseMap<ValuePair, int> CandidatePairCostSavings;
+  //   ShouldContinue = getCandidatePairs(BB, Start, CandidatePairs,
+  //                                      FixedOrderPairs,
+  //                                      CandidatePairCostSavings,
+  //                                      PairableInsts, NonPow2Len);
+  //   if (PairableInsts.empty()) return false;
+
+  //   // Build the candidate pair set for faster lookups.
+  //   DenseSet<ValuePair> CandidatePairsSet;
+  //   for (DenseMap<Value *, std::vector<Value *> >::iterator I =
+  //          CandidatePairs.begin(), E = CandidatePairs.end(); I != E; ++I)
+  //     for (std::vector<Value *>::iterator J = I->second.begin(),
+  //            JE = I->second.end(); J != JE; ++J)
+  //       CandidatePairsSet.insert(ValuePair(I->first, *J));
+
+
+  //   // Now we have a map of all of the pairable instructions and we need to
+  //   // select the best possible pairing. A good pairing is one such that the
+  //   // users of the pair are also paired. This defines a (directed) forest
+  //   // over the pairs such that two pairs are connected iff the second pair
+  //   // uses the first.
+
+  //   // Note that it only matters that both members of the second pair use some
+  //   // element of the first pair (to allow for splatting).
+
+  //   DenseMap<ValuePair, std::vector<ValuePair> > ConnectedPairs,
+  //     ConnectedPairDeps;
+  //   DenseMap<VPPair, unsigned> PairConnectionTypes;
+  //   computeConnectedPairs(CandidatePairs, CandidatePairsSet,
+  //                         PairableInsts, ConnectedPairs, PairConnectionTypes);
+  //   if (ConnectedPairs.empty()) return false;
+
+  //   for (DenseMap<ValuePair, std::vector<ValuePair> >::iterator
+  //          I = ConnectedPairs.begin(), IE = ConnectedPairs.end();
+  //        I != IE; ++I)
+  //     for (std::vector<ValuePair>::iterator J = I->second.begin(),
+  //            JE = I->second.end(); J != JE; ++J)
+  //       ConnectedPairDeps[*J].push_back(I->first);
+
+
+
+
+
+
+  //   // Only for the chosen pairs, propagate information on fixed-order pairs,
+  //   // pair connections, and their types to the data structures used by the
+  //   // pair fusion procedures.
+  //   for (DenseMap<Value *, Value *>::iterator I = AllChosenPairs.begin(),
+  //          IE = AllChosenPairs.end(); I != IE; ++I) {
+  //     if (FixedOrderPairs.count(*I))
+  //       AllFixedOrderPairs.insert(*I);
+  //     else if (FixedOrderPairs.count(ValuePair(I->second, I->first)))
+  //       AllFixedOrderPairs.insert(ValuePair(I->second, I->first));
+
+  //     for (DenseMap<Value *, Value *>::iterator J = AllChosenPairs.begin();
+  //          J != IE; ++J) {
+  //       DenseMap<VPPair, unsigned>::iterator K =
+  //         PairConnectionTypes.find(VPPair(*I, *J));
+  //       if (K != PairConnectionTypes.end()) {
+  //         AllPairConnectionTypes.insert(*K);
+  //       } else {
+  //         K = PairConnectionTypes.find(VPPair(*J, *I));
+  //         if (K != PairConnectionTypes.end())
+  //           AllPairConnectionTypes.insert(*K);
+  //       }
+  //     }
+  //   }
+
+  //   for (DenseMap<ValuePair, std::vector<ValuePair> >::iterator
+  //          I = ConnectedPairs.begin(), IE = ConnectedPairs.end();
+  //        I != IE; ++I)
+  //     for (std::vector<ValuePair>::iterator J = I->second.begin(),
+  //            JE = I->second.end(); J != JE; ++J)
+  //       if (AllPairConnectionTypes.count(VPPair(I->first, *J))) {
+  //         AllConnectedPairs[I->first].push_back(*J);
+  //         AllConnectedPairDeps[*J].push_back(I->first);
+  //       }
+
+  //   if (AllChosenPairs.empty()) return false;
+  //   NumFusedOpsGlobal += AllChosenPairs.size();
+
+  //   // A set of pairs has now been selected. It is now necessary to replace the
+  //   // paired instructions with vector instructions. For this procedure each
+  //   // operand must be replaced with a vector operand. This vector is formed
+  //   // by using build_vector on the old operands. The replaced values are then
+  //   // replaced with a vector_extract on the result.  Subsequent optimization
+  //   // passes should coalesce the build/extract combinations.
+
+  //   fuseChosenPairs(BB, AllPairableInsts, AllChosenPairs, AllFixedOrderPairs,
+  //                   AllPairConnectionTypes,
+  //                   AllConnectedPairs, AllConnectedPairDeps);
+
+  //   // It is important to cleanup here so that future iterations of this
+  //   // function have less work to do.
+  //   (void) SimplifyInstructionsInBlock(&BB, TD, AA->getTargetLibraryInfo());
+  //   return true;
+  // }
+
+  bool BBVectorizeGlobal::instructionsOverlap(const ValuePair &left, const ValuePair &right) {
+    return left.first == right.first || left.first == right.second ||
+      left.second == right.first || left.second == right.second;
+  }
+
+  void BBVectorizeGlobal::constructVariablePack(DenseSet<ValuePair> &CandidatePairsSet,
+                                                VPGraph &VariablePackGraph) {
+    for (DenseSet<ValuePair>::iterator P = CandidatePairsSet.begin(), PE = CandidatePairsSet.end(); P != PE; ++P) {
+      User *first = cast<User>(P->first), *second = cast<User>(P->second);
+      assert(first->getNumOperands() == second->getNumOperands() &&
+             "Vectorization candidates should have the same number of arguments");
+
+      Value *firstOp = first, *secondOp = second;
+      for (int i = 0, e = first->getNumOperands(); i <= e; ++i) {
+        VPPair NewNode(ValuePair(firstOp, secondOp), *P);
+        std::vector<VPPair> Conflicts;
+        for (VPGraph::iterator VP = VariablePackGraph.begin(), EVP = VariablePackGraph.end(); VP != EVP; ++VP) {
+          ValuePair Instrs = VP->first.second;
+          if (Instrs != *P && instructionsOverlap(Instrs, *P)) {
+            VP->second.push_back(NewNode);
+            Conflicts.push_back(VP->first);
+          }
+        }
+
+        VariablePackGraph.insert(std::pair<VPPair, std::vector<VPPair> >(NewNode, Conflicts));
+
+        if (i < e) {
+          firstOp = first->getOperand(i);
+          secondOp = second->getOperand(i);
+        }
+      }
+    }
+  }
+
+  void BBVectorizeGlobal::constructStatementGrouping(DenseSet<ValuePair> &CandidatePairsSet,
+                                                     VPGraph &VariablePackGraph,
+                                                     DenseSet<VPairWithWeight> &StatementGroupingEdges) {
+    for (DenseSet<ValuePair>::iterator P = CandidatePairsSet.begin(), PE = CandidatePairsSet.end(); P != PE; ++P) {
+
+      VPGraph AuxGraph;
+      BBVectorizeGlobal::createAuxGraph(*P, AuxGraph, VariablePackGraph);
+
+      unsigned NumAuxNodes = processAuxGraph(AuxGraph);
+
+      unsigned NumVarPackNodes = 0;
+      for (VPGraph::iterator VPI = VariablePackGraph.begin(); VPI != VariablePackGraph.end(); VPI++) {
+        if (VPI->first.second == *P) {
+          NumVarPackNodes++;
+        }
+      }
+
+      //errs() << NumAuxNodes << '/' << NumVarPackNodes << '\n';
+      double weight;
+      if (NumVarPackNodes == 0 || NumAuxNodes == 0)
+        weight = 0;
+      else
+        weight = (double) NumAuxNodes/NumVarPackNodes;
+      StatementGroupingEdges.insert(VPairWithWeight(*P, weight));
+    }
+  }
+
+  void BBVectorizeGlobal::updateStatementGrouping(VPGraph &VariablePackGraph,
+                                                  VPGraph &OriginalVarPackGraph,
+                                                  DenseSet<VPairWithWeight> &StatementGroupingEdges) {
+    for (DenseSet<VPairWithWeight>::iterator P = StatementGroupingEdges.begin(), PE = StatementGroupingEdges.end(); P != PE; ++P) {
+
+      VPGraph AuxGraph;
+      BBVectorizeGlobal::createAuxGraph(P->first, AuxGraph, OriginalVarPackGraph);
+
+      unsigned NumAuxNodes = processAuxGraph(AuxGraph);
+
+      unsigned NumVarPackNodes = 0;
+      for (VPGraph::iterator VPI = VariablePackGraph.begin(); VPI != VariablePackGraph.end(); VPI++) {
+        if (VPI->first.second == P->first) {
+          NumVarPackNodes++;
+        }
+      }
+
+      //errs() << NumAuxNodes << '/' << NumVarPackNodes << '\n';
+      double weight;
+      if (NumVarPackNodes == 0 || NumAuxNodes == 0)
+        weight = 0;
+      else
+        weight = (double) NumAuxNodes/NumVarPackNodes;
+
+      P->second = weight;
+    }
+  }
+
+  void BBVectorizeGlobal::createAuxGraph(ValuePair &Pair, VPGraph &AuxGraph, VPGraph &VariablePackGraph) {
+    User *first = cast<User>(Pair.first), *second = cast<User>(Pair.second);
+
+    for (int i = 0, e = first->getNumOperands(); i < e; ++i) {
+      Value *firstOp = first->getOperand(i), *secondOp = second->getOperand(i);
+
+      ValuePair args(firstOp, secondOp);
+      for (VPGraph::iterator VPI = VariablePackGraph.begin(); VPI != VariablePackGraph.end(); VPI++) {
+        if (VPI->first.first == args) {
+          if (VPI->first.second != Pair) {
+            AuxGraph.insert(*VPI);
+          }
+        }
+      }
+    }
+
+    for (VPGraph::iterator AuxI = AuxGraph.begin(); AuxI != AuxGraph.end(); AuxI++) {
+      for (std::vector<VPPair>::iterator Edge = AuxI->second.begin(); Edge != AuxI->second.end(); ) {
+        if (!AuxGraph.count(*Edge)) {
+          Edge = AuxI->second.erase(Edge);
+        } else {
+          ++Edge;
+        }
+      }
+    }
+
+    // for (VPGraph::iterator I = AuxGraph.begin(); I != AuxGraph.end(); I++) {
+    //   errs() << "Aux: ";
+    //   errs() << "{(" << *I->first.first.first << ',' << *I->first.first.second << "),";
+    //   errs() << '(' << *I->first.second.first << ',' << *I->first.second.second << ")} ->\n";
+    //   for (std::vector<VPPair>::iterator Edges = I->second.begin(); Edges != I->second.end(); ) {
+    //     errs() << "    {(" << *Edges->first.first << ',' << *Edges->first.second << "),";
+    //     errs() << '(' << *Edges->second.first << ',' << *Edges->second.second << ")}\n";
+    //   }
+    // }
+  }
+
+  unsigned BBVectorizeGlobal::processAuxGraph(VPGraph &AuxGraph) {
+    unsigned MaxDegree = 1;
+    VPGraph::iterator MaxNode;
+    while (MaxDegree > 0) {
+      MaxDegree = 0;
+      for (VPGraph::iterator AuxI = AuxGraph.begin(); AuxI != AuxGraph.end(); AuxI++) {
+        if (AuxI->second.size() > MaxDegree) {
+          MaxDegree = AuxI->second.size();
+          MaxNode = AuxI;
+        }
+      }
+
+      if (MaxDegree > 0) {
+        for (VPGraph::iterator AuxI = AuxGraph.begin(); AuxI != AuxGraph.end(); AuxI++) {
+          for (std::vector<VPPair>::iterator Edge = AuxI->second.begin(); Edge != AuxI->second.end(); ) {
+            if (*Edge == MaxNode->first) {
+              Edge = AuxI->second.erase(Edge);
+            } else {
+              ++Edge;
+            }
+          }
+        }
+        AuxGraph.erase(MaxNode);
+      }
+    }
+
+    return AuxGraph.size();
+  }
+
+  void BBVectorizeGlobal::eraseAndRecalculate(ValuePair &ChosenPair,
+                                              VPGraph &VariablePackGraph,
+                                              VPGraph &OriginalVarPackGraph,
+                                              DenseSet<VPairWithWeight> &StatementGroupingEdges,
+                                              DenseSet<ValuePair> &CandidatePairsSet) {
+    errs() << "Starting erase and recalculate\n";
+    errs() << "Statement grouping edge count (before): " << StatementGroupingEdges.size() << '\n';
+
+    for (DenseSet<VPairWithWeight>::iterator SGI = StatementGroupingEdges.begin(); SGI != StatementGroupingEdges.end(); ) {
+      if (instructionsOverlap(SGI->first, ChosenPair)) {
+        CandidatePairsSet.erase(SGI->first);
+        StatementGroupingEdges.erase(SGI);
+        SGI = StatementGroupingEdges.begin();
+      } else {
+        ++SGI;
+      }
+    }
+
+    errs() << "Statement grouping edge count: " << StatementGroupingEdges.size() << '\n';
+
+    std::vector<VPPair> DeleteQueue;
+    for (VPGraph::iterator VPI = VariablePackGraph.begin(); VPI != VariablePackGraph.end(); ++VPI) {
+      if (VPI->first.second == ChosenPair) {
+        DeleteQueue.push_back(VPI->first);
+      }
+    }
+
+    while (DeleteQueue.size() > 0) {
+      VPPair CurPair = DeleteQueue.back();
+      DeleteQueue.pop_back();
+      // errs() << "Removing: " << *CurPair.first.first << ' ' << *CurPair.first.second << '\n';
+      std::vector<VPPair> Edges = VariablePackGraph[CurPair];
+      for (std::vector<VPPair>::iterator Edge = Edges.begin(); Edge != Edges.end(); Edge++) {
+        if (VariablePackGraph.count(*Edge) > 0) {
+          DeleteQueue.push_back(*Edge);
+        }
+      }
+      VariablePackGraph.erase(CurPair);
+    }
+    // for (VPGraph::iterator VPI = VariablePackGraph.begin(); VPI != VariablePackGraph.end(); ) {
+    //   if (VPI->first.second == ChosenPair) {
+    //     VariablePackGraph.erase(VPI++);
+    //   } else {
+    //     for (std::vector<VPPair>::iterator Edge = VPI->second.begin(); Edge != VPI->second.end(); ) {
+    //       if (Edge->second == ChosenPair) {
+    //         break;
+    //       }
+    //     }
+    //     ++VPI;
+    //   }
+    // }
+
+    
+  }
+                                              
+
   // This function returns true if the provided instruction is capable of being
   // fused into a vector instruction. This determination is based only on the
   // type and other attributes of the instruction.
-  bool BBVectorize::isInstVectorizable(Instruction *I,
+  bool BBVectorizeGlobal::isInstVectorizable(Instruction *I,
                                          bool &IsSimpleLoadStore) {
     IsSimpleLoadStore = false;
 
@@ -953,7 +1303,7 @@ namespace {
   // (meaning that they can be fused into a vector instruction). This assumes
   // that I has already been determined to be vectorizable and that J is not
   // in the use dag of I.
-  bool BBVectorize::areInstsCompatible(Instruction *I, Instruction *J,
+  bool BBVectorizeGlobal::areInstsCompatible(Instruction *I, Instruction *J,
                        bool IsSimpleLoadStore, bool NonPow2Len,
                        int &CostSavings, int &FixedOrder) {
     DEBUG(if (DebugInstructionExamination) dbgs() << "BBV: looking at " << *I <<
@@ -1150,7 +1500,7 @@ namespace {
   // function is called during the process of moving instructions during
   // vectorization and the results of the alias analysis are not stable during
   // that process.
-  bool BBVectorize::trackUsesOfI(DenseSet<Value *> &Users,
+  bool BBVectorizeGlobal::trackUsesOfI(DenseSet<Value *> &Users,
                        AliasSetTracker &WriteSet, Instruction *I,
                        Instruction *J, bool UpdateUsers,
                        DenseSet<ValuePair> *LoadMoveSetPairs) {
@@ -1194,7 +1544,7 @@ namespace {
 
   // This function iterates over all instruction pairs in the provided
   // basic block and collects all candidate pairs for vectorization.
-  bool BBVectorize::getCandidatePairs(BasicBlock &BB,
+  bool BBVectorizeGlobal::getCandidatePairs(BasicBlock &BB,
                        BasicBlock::iterator &Start,
                        DenseMap<Value *, std::vector<Value *> > &CandidatePairs,
                        DenseSet<ValuePair> &FixedOrderPairs,
@@ -1208,7 +1558,7 @@ namespace {
     for (BasicBlock::iterator I = Start++; I != E; ++I) {
       if (I == Start) IAfterStart = true;
 
-      errs() << "  " << *I << '\n';
+      // errs() << "  " << *I << '\n';
 
       bool IsSimpleLoadStore;
       if (!isInstVectorizable(I, IsSimpleLoadStore)) continue;
@@ -1293,7 +1643,7 @@ namespace {
   // Finds candidate pairs connected to the pair P = <PI, PJ>. This means that
   // it looks for pairs such that both members have an input which is an
   // output of PI or PJ.
-  void BBVectorize::computePairsConnectedTo(
+  void BBVectorizeGlobal::computePairsConnectedTo(
                   DenseMap<Value *, std::vector<Value *> > &CandidatePairs,
                   DenseSet<ValuePair> &CandidatePairsSet,
                   std::vector<Value *> &PairableInsts,
@@ -1384,7 +1734,7 @@ namespace {
   // This function figures out which pairs are connected.  Two pairs are
   // connected if some output of the first pair forms an input to both members
   // of the second pair.
-  void BBVectorize::computeConnectedPairs(
+  void BBVectorizeGlobal::computeConnectedPairs(
                   DenseMap<Value *, std::vector<Value *> > &CandidatePairs,
                   DenseSet<ValuePair> &CandidatePairsSet,
                   std::vector<Value *> &PairableInsts,
@@ -1415,7 +1765,7 @@ namespace {
   // This function builds a set of use tuples such that <A, B> is in the set
   // if B is in the use dag of A. If B is in the use dag of A, then B
   // depends on the output of A.
-  void BBVectorize::buildDepMap(
+  void BBVectorizeGlobal::buildDepMap(
                       BasicBlock &BB,
                       DenseMap<Value *, std::vector<Value *> > &CandidatePairs,
                       std::vector<Value *> &PairableInsts,
@@ -1458,7 +1808,7 @@ namespace {
   // Returns true if an input to pair P is an output of pair Q and also an
   // input of pair Q is an output of pair P. If this is the case, then these
   // two pairs cannot be simultaneously fused.
-  bool BBVectorize::pairsConflict(ValuePair P, ValuePair Q,
+  bool BBVectorizeGlobal::pairsConflict(ValuePair P, ValuePair Q,
              DenseSet<ValuePair> &PairableInstUsers,
              DenseMap<ValuePair, std::vector<ValuePair> > *PairableInstUserMap,
              DenseSet<VPPair> *PairableInstUserPairSet) {
@@ -1490,7 +1840,7 @@ namespace {
 
   // This function walks the use graph of current pairs to see if, starting
   // from P, the walk returns to P.
-  bool BBVectorize::pairWillFormCycle(ValuePair P,
+  bool BBVectorizeGlobal::pairWillFormCycle(ValuePair P,
              DenseMap<ValuePair, std::vector<ValuePair> > &PairableInstUserMap,
              DenseSet<ValuePair> &CurrentPairs) {
     DEBUG(if (DebugCycleCheck)
@@ -1533,7 +1883,7 @@ namespace {
 
   // This function builds the initial dag of connected pairs with the
   // pair J at the root.
-  void BBVectorize::buildInitialDAGFor(
+  void BBVectorizeGlobal::buildInitialDAGFor(
                   DenseMap<Value *, std::vector<Value *> > &CandidatePairs,
                   DenseSet<ValuePair> &CandidatePairsSet,
                   std::vector<Value *> &PairableInsts,
@@ -1581,7 +1931,7 @@ namespace {
 
   // Given some initial dag, prune it by removing conflicting pairs (pairs
   // that cannot be simultaneously chosen for vectorization).
-  void BBVectorize::pruneDAGFor(
+  void BBVectorizeGlobal::pruneDAGFor(
               DenseMap<Value *, std::vector<Value *> > &CandidatePairs,
               std::vector<Value *> &PairableInsts,
               DenseMap<ValuePair, std::vector<ValuePair> > &ConnectedPairs,
@@ -1751,7 +2101,7 @@ namespace {
 
   // This function finds the best dag of mututally-compatible connected
   // pairs, given the choice of root pairs as an iterator range.
-  void BBVectorize::findBestDAGFor(
+  void BBVectorizeGlobal::findBestDAGFor(
               DenseMap<Value *, std::vector<Value *> > &CandidatePairs,
               DenseSet<ValuePair> &CandidatePairsSet,
               DenseMap<ValuePair, int> &CandidatePairCostSavings,
@@ -2135,7 +2485,7 @@ namespace {
 
   // Given the list of candidate pairs, this function selects those
   // that will be fused into vector instructions.
-  void BBVectorize::choosePairs(
+  void BBVectorizeGlobal::choosePairs(
                 DenseMap<Value *, std::vector<Value *> > &CandidatePairs,
                 DenseSet<ValuePair> &CandidatePairsSet,
                 DenseMap<ValuePair, int> &CandidatePairCostSavings,
@@ -2145,91 +2495,56 @@ namespace {
                 DenseMap<ValuePair, std::vector<ValuePair> > &ConnectedPairs,
                 DenseMap<ValuePair, std::vector<ValuePair> > &ConnectedPairDeps,
                 DenseSet<ValuePair> &PairableInstUsers,
-                DenseMap<Value *, Value *>& ChosenPairs) {
-    bool UseCycleCheck =
-     CandidatePairsSet.size() <= Config.MaxCandPairsForCycleCheck;
+                DenseMap<Value *, Value *> &ChosenPairs) {
 
-    DenseMap<Value *, std::vector<Value *> > CandidatePairs2;
-    for (DenseSet<ValuePair>::iterator I = CandidatePairsSet.begin(),
-         E = CandidatePairsSet.end(); I != E; ++I) {
-      std::vector<Value *> &JJ = CandidatePairs2[I->second];
-      if (JJ.empty()) JJ.reserve(32);
-      JJ.push_back(I->first);
-    }
+    //errs() << "Pairable insts: " << PairableInsts.size() << '\n';
 
-    DenseMap<ValuePair, std::vector<ValuePair> > PairableInstUserMap;
-    DenseSet<VPPair> PairableInstUserPairSet;
-    for (std::vector<Value *>::iterator I = PairableInsts.begin(),
-         E = PairableInsts.end(); I != E; ++I) {
-      // The number of possible pairings for this variable:
-      size_t NumChoices = CandidatePairs.lookup(*I).size();
-      if (!NumChoices) continue;
 
-      std::vector<Value *> &JJ = CandidatePairs[*I];
+    // errs() << "Candidate Pairs:\n";
+    // for (DenseSet<ValuePair>::iterator I = CandidatePairsSet.begin(); I != CandidatePairsSet.end(); ++I) {
+    //   errs() << *I->first << ',' << *I->second << '\n';
+    // }
 
-      // The best pair to choose and its dag:
-      size_t BestMaxDepth = 0;
-      int BestEffSize = 0;
-      DenseSet<ValuePair> BestDAG;
-      findBestDAGFor(CandidatePairs, CandidatePairsSet,
-                      CandidatePairCostSavings,
-                      PairableInsts, FixedOrderPairs, PairConnectionTypes,
-                      ConnectedPairs, ConnectedPairDeps,
-                      PairableInstUsers, PairableInstUserMap,
-                      PairableInstUserPairSet, ChosenPairs,
-                      BestDAG, BestMaxDepth, BestEffSize, *I, JJ,
-                      UseCycleCheck);
+    // Step 2: Initialize variable pack conflicting graph
+    VPGraph VariablePackGraph;
+    constructVariablePack(CandidatePairsSet, VariablePackGraph);
+    VPGraph OriginalVarPackGraph = VariablePackGraph;
 
-      if (BestDAG.empty())
-        continue;
 
-      // A dag has been chosen (or not) at this point. If no dag was
-      // chosen, then this instruction, I, cannot be paired (and is no longer
-      // considered).
+    // for (VPGraph::iterator I = VariablePackGraph.begin(); I != VariablePackGraph.end(); I++) {
+    //   errs() << "{(" << *I->first.first.first << ',' << *I->first.first.second << "),";
+    //   errs() << '(' << *I->first.second.first << ',' << *I->first.second.second << ")} ->\n";
+    //   for (std::vector<VPPair>::iterator Edges = I->second.begin(); Edges != I->second.end(); Edges++) {
+    //     errs() << "    {(" << *Edges->first.first << ',' << *Edges->first.second << "),";
+    //     errs() << '(' << *Edges->second.first << ',' << *Edges->second.second << ")}\n";
+    //   }
+    // }
+    
+    // Step 3: Initialize statement grouping graph
+    DenseSet<VPairWithWeight> StatementGroupingEdges;
+    constructStatementGrouping(CandidatePairsSet, VariablePackGraph, StatementGroupingEdges);
 
-      DEBUG(dbgs() << "BBV: selected pairs in the best DAG for: "
-                   << *cast<Instruction>(*I) << "\n");
 
-      for (DenseSet<ValuePair>::iterator S = BestDAG.begin(),
-           SE2 = BestDAG.end(); S != SE2; ++S) {
-        // Insert the members of this dag into the list of chosen pairs.
-        ChosenPairs.insert(ValuePair(S->first, S->second));
-        DEBUG(dbgs() << "BBV: selected pair: " << *S->first << " <-> " <<
-               *S->second << "\n");
+    while (StatementGroupingEdges.size() > 0) {
+      errs() << "StatementGroupingEdges (" << StatementGroupingEdges.size() << "):\n";
+      for (DenseSet<VPairWithWeight>::iterator SGI = StatementGroupingEdges.begin(); SGI != StatementGroupingEdges.end(); ++SGI) {
+        errs() << '(' << *SGI->first.first << ',' << *SGI->first.second << ") : " << SGI->second << '\n';
+      }
 
-        // Remove all candidate pairs that have values in the chosen dag.
-        std::vector<Value *> &KK = CandidatePairs[S->first];
-        for (std::vector<Value *>::iterator K = KK.begin(), KE = KK.end();
-             K != KE; ++K) {
-          if (*K == S->second)
-            continue;
-
-          CandidatePairsSet.erase(ValuePair(S->first, *K));
-        }
-
-        std::vector<Value *> &LL = CandidatePairs2[S->second];
-        for (std::vector<Value *>::iterator L = LL.begin(), LE = LL.end();
-             L != LE; ++L) {
-          if (*L == S->first)
-            continue;
-
-          CandidatePairsSet.erase(ValuePair(*L, S->second));
-        }
-
-        std::vector<Value *> &MM = CandidatePairs[S->second];
-        for (std::vector<Value *>::iterator M = MM.begin(), ME = MM.end();
-             M != ME; ++M) {
-          assert(*M != S->first && "Flipped pair in candidate list?");
-          CandidatePairsSet.erase(ValuePair(S->second, *M));
-        }
-
-        std::vector<Value *> &NN = CandidatePairs2[S->first];
-        for (std::vector<Value *>::iterator N = NN.begin(), NE = NN.end();
-             N != NE; ++N) {
-          assert(*N != S->second && "Flipped pair in candidate list?");
-          CandidatePairsSet.erase(ValuePair(*N, S->first));
+      double MaxWeight = -1;
+      DenseSet<VPairWithWeight>::iterator MaxPair = StatementGroupingEdges.end();
+      for (DenseSet<VPairWithWeight>::iterator SGI = StatementGroupingEdges.begin(); SGI != StatementGroupingEdges.end(); ++SGI) {
+        if (SGI->second > MaxWeight) {
+          MaxWeight = SGI->second;
+          MaxPair = SGI;
         }
       }
+      ValuePair ChosenPair(MaxPair->first.first, MaxPair->first.second);
+      if (!(isa<InsertElementInst>(MaxPair->first.first) || isa<ExtractElementInst>(MaxPair->first.first))) {
+        errs() << "Pairing " << *ChosenPair.first << " " << *ChosenPair.second << '\n';
+        ChosenPairs.insert(ValuePair(ChosenPair.first, ChosenPair.second));
+      }
+      eraseAndRecalculate(ChosenPair, VariablePackGraph, OriginalVarPackGraph, StatementGroupingEdges, CandidatePairsSet);
     }
 
     DEBUG(dbgs() << "BBV: selected " << ChosenPairs.size() << " pairs.\n");
@@ -2246,7 +2561,7 @@ namespace {
 
   // Returns the value that is to be used as the pointer input to the vector
   // instruction that fuses I with J.
-  Value *BBVectorize::getReplacementPointerInput(LLVMContext& Context,
+  Value *BBVectorizeGlobal::getReplacementPointerInput(LLVMContext& Context,
                      Instruction *I, Instruction *J, unsigned o) {
     Value *IPtr, *JPtr;
     unsigned IAlignment, JAlignment, IAddressSpace, JAddressSpace;
@@ -2270,7 +2585,7 @@ namespace {
                         /* insert before */ I);
   }
 
-  void BBVectorize::fillNewShuffleMask(LLVMContext& Context, Instruction *J,
+  void BBVectorizeGlobal::fillNewShuffleMask(LLVMContext& Context, Instruction *J,
                      unsigned MaskOffset, unsigned NumInElem,
                      unsigned NumInElem1, unsigned IdxOffset,
                      std::vector<Constant*> &Mask) {
@@ -2292,7 +2607,7 @@ namespace {
 
   // Returns the value that is to be used as the vector-shuffle mask to the
   // vector instruction that fuses I with J.
-  Value *BBVectorize::getReplacementShuffleMask(LLVMContext& Context,
+  Value *BBVectorizeGlobal::getReplacementShuffleMask(LLVMContext& Context,
                      Instruction *I, Instruction *J) {
     // This is the shuffle mask. We need to append the second
     // mask to the first, and the numbers need to be adjusted.
@@ -2333,7 +2648,7 @@ namespace {
     return ConstantVector::get(Mask);
   }
 
-  bool BBVectorize::expandIEChain(LLVMContext& Context, Instruction *I,
+  bool BBVectorizeGlobal::expandIEChain(LLVMContext& Context, Instruction *I,
                                   Instruction *J, unsigned o, Value *&LOp,
                                   unsigned numElemL,
                                   Type *ArgTypeL, Type *ArgTypeH,
@@ -2376,7 +2691,7 @@ namespace {
 
   // Returns the value to be used as the specified operand of the vector
   // instruction that fuses I with J.
-  Value *BBVectorize::getReplacementInput(LLVMContext& Context, Instruction *I,
+  Value *BBVectorizeGlobal::getReplacementInput(LLVMContext& Context, Instruction *I,
                      Instruction *J, unsigned o, bool IBeforeJ) {
     Value *CV0 = ConstantInt::get(Type::getInt32Ty(Context), 0);
     Value *CV1 = ConstantInt::get(Type::getInt32Ty(Context), 1);
@@ -2719,7 +3034,7 @@ namespace {
 
   // This function creates an array of values that will be used as the inputs
   // to the vector instruction that fuses I with J.
-  void BBVectorize::getReplacementInputsForPair(LLVMContext& Context,
+  void BBVectorizeGlobal::getReplacementInputsForPair(LLVMContext& Context,
                      Instruction *I, Instruction *J,
                      SmallVector<Value *, 3> &ReplacedOperands,
                      bool IBeforeJ) {
@@ -2766,7 +3081,7 @@ namespace {
   // original I and J instructions. These are generally vector shuffles
   // or extracts. In many cases, these will end up being unused and, thus,
   // eliminated by later passes.
-  void BBVectorize::replaceOutputsOfPair(LLVMContext& Context, Instruction *I,
+  void BBVectorizeGlobal::replaceOutputsOfPair(LLVMContext& Context, Instruction *I,
                      Instruction *J, Instruction *K,
                      Instruction *&InsertionPt,
                      Instruction *&K1, Instruction *&K2) {
@@ -2830,7 +3145,7 @@ namespace {
   }
 
   // Move all uses of the function I (including pairing-induced uses) after J.
-  bool BBVectorize::canMoveUsesOfIAfterJ(BasicBlock &BB,
+  bool BBVectorizeGlobal::canMoveUsesOfIAfterJ(BasicBlock &BB,
                      DenseSet<ValuePair> &LoadMoveSetPairs,
                      Instruction *I, Instruction *J) {
     // Skip to the first instruction past I.
@@ -2849,7 +3164,7 @@ namespace {
   }
 
   // Move all uses of the function I (including pairing-induced uses) after J.
-  void BBVectorize::moveUsesOfIAfterJ(BasicBlock &BB,
+  void BBVectorizeGlobal::moveUsesOfIAfterJ(BasicBlock &BB,
                      DenseSet<ValuePair> &LoadMoveSetPairs,
                      Instruction *&InsertionPt,
                      Instruction *I, Instruction *J) {
@@ -2877,7 +3192,7 @@ namespace {
   // Collect all load instruction that are in the move set of a given first
   // pair member.  These loads depend on the first instruction, I, and so need
   // to be moved after J (the second instruction) when the pair is fused.
-  void BBVectorize::collectPairLoadMoveSet(BasicBlock &BB,
+  void BBVectorizeGlobal::collectPairLoadMoveSet(BasicBlock &BB,
                      DenseMap<Value *, Value *> &ChosenPairs,
                      DenseMap<Value *, std::vector<Value *> > &LoadMoveSet,
                      DenseSet<ValuePair> &LoadMoveSetPairs,
@@ -2908,7 +3223,7 @@ namespace {
   // relies on finding the same use dags here as were found earlier, we'll
   // need to precompute the necessary aliasing information here and then
   // manually update it during the fusion process.
-  void BBVectorize::collectLoadMoveSet(BasicBlock &BB,
+  void BBVectorizeGlobal::collectLoadMoveSet(BasicBlock &BB,
                      std::vector<Value *> &PairableInsts,
                      DenseMap<Value *, Value *> &ChosenPairs,
                      DenseMap<Value *, std::vector<Value *> > &LoadMoveSet,
@@ -2927,7 +3242,7 @@ namespace {
   // When the first instruction in each pair is cloned, it will inherit its
   // parent's metadata. This metadata must be combined with that of the other
   // instruction in a safe way.
-  void BBVectorize::combineMetadata(Instruction *K, const Instruction *J) {
+  void BBVectorizeGlobal::combineMetadata(Instruction *K, const Instruction *J) {
     SmallVector<std::pair<unsigned, MDNode*>, 4> Metadata;
     K->getAllMetadataOtherThanDebugLoc(Metadata);
     for (unsigned i = 0, n = Metadata.size(); i < n; ++i) {
@@ -2955,7 +3270,7 @@ namespace {
   // need to be moved to after the location of the second member of the pair
   // because the vector instruction is inserted in the location of the pair's
   // second member).
-  void BBVectorize::fuseChosenPairs(BasicBlock &BB,
+  void BBVectorizeGlobal::fuseChosenPairs(BasicBlock &BB,
              std::vector<Value *> &PairableInsts,
              DenseMap<Value *, Value *> &ChosenPairs,
              DenseSet<ValuePair> &FixedOrderPairs,
@@ -2993,7 +3308,7 @@ namespace {
         // These instructions are not really fused, but are tracked as though
         // they are. Any case in which it would be interesting to fuse them
         // will be taken care of by InstCombine.
-        --NumFusedOps;
+        --NumFusedOpsGlobal;
         ++PI;
         continue;
       }
@@ -3014,7 +3329,7 @@ namespace {
         DEBUG(dbgs() << "BBV: fusion of: " << *I <<
                " <-> " << *J <<
                " aborted because of non-trivial dependency cycle\n");
-        --NumFusedOps;
+        --NumFusedOpsGlobal;
         ++PI;
         continue;
       }
@@ -3170,27 +3485,27 @@ namespace {
   }
 }
 
-char BBVectorize::ID = 0;
+char BBVectorizeGlobal::ID = 0;
 static const char bb_vectorize_name[] = "Basic-Block Vectorization";
-INITIALIZE_PASS_BEGIN(BBVectorize, BBV_NAME, bb_vectorize_name, false, false)
+INITIALIZE_PASS_BEGIN(BBVectorizeGlobal, BBV_NAME, bb_vectorize_name, false, false)
 INITIALIZE_AG_DEPENDENCY(AliasAnalysis)
 INITIALIZE_AG_DEPENDENCY(TargetTransformInfo)
 INITIALIZE_PASS_DEPENDENCY(DominatorTree)
 INITIALIZE_PASS_DEPENDENCY(ScalarEvolution)
-INITIALIZE_PASS_END(BBVectorize, BBV_NAME, bb_vectorize_name, false, false)
+INITIALIZE_PASS_END(BBVectorizeGlobal, BBV_NAME, bb_vectorize_name, false, false)
 
-BasicBlockPass *llvm::createBBVectorizePass(const VectorizeConfig &C) {
-  return new BBVectorize(C);
+BasicBlockPass *llvm::createBBVectorizeGlobalPass(const VectorizeConfigGlobal &C) {
+  return new BBVectorizeGlobal(C);
 }
 
-bool
-llvm::vectorizeBasicBlock(Pass *P, BasicBlock &BB, const VectorizeConfig &C) {
-  BBVectorize BBVectorizer(P, C);
-  return BBVectorizer.vectorizeBB(BB);
-}
+// bool
+// llvm::vectorizeBasicBlock(Pass *P, BasicBlock &BB, const VectorizeConfig &C) {
+//   BBVectorizeGlobal BBVectorizer(P, C);
+//   return BBVectorizer.vectorizeBB(BB);
+// }
 
 //===----------------------------------------------------------------------===//
-VectorizeConfig::VectorizeConfig() {
+VectorizeConfigGlobal::VectorizeConfigGlobal() {
   VectorBits = ::VectorBits;
   VectorizeBools = !::NoBools;
   VectorizeInts = !::NoInts;

@@ -104,6 +104,7 @@ public:
   bool DisableUnitAtATime;
   bool DisableUnrollLoops;
   bool BBVectorize;
+  bool BBVectorizeGlobal;
   bool SLPVectorize;
   bool LoopVectorize;
 

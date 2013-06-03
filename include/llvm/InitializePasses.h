@@ -274,6 +274,7 @@ void initializeFinalizeMachineBundlesPass(PassRegistry&);
 void initializeLoopVectorizePass(PassRegistry&);
 void initializeSLPVectorizerPass(PassRegistry&);
 void initializeBBVectorizePass(PassRegistry&);
+void initializeBBVectorizeGlobalPass(PassRegistry&);
 void initializeMachineFunctionPrinterPassPass(PassRegistry&);
 }
 

@@ -14,6 +14,7 @@
 #ifndef LLVM_ADT_DENSEMAPINFO_H
 #define LLVM_ADT_DENSEMAPINFO_H
 
+#include <cmath>
 #include "llvm/Support/PointerLikeTypeTraits.h"
 #include "llvm/Support/type_traits.h"
 
@@ -126,6 +127,19 @@ template<> struct DenseMapInfo<long long> {
   static bool isEqual(const long long& LHS,
                       const long long& RHS) {
     return LHS == RHS;
+  }
+};
+
+// Provide DenseMapInfo for doubles.
+template<> struct DenseMapInfo<double> {
+  static inline double getEmptyKey() { return INFINITY; }
+  static inline double getTombstoneKey() { return NAN; }
+  static unsigned getHashValue(const double& Val) {
+    return (unsigned)(Val * 37ULL);
+  }
+  static bool isEqual(const double& LHS,
+                      const double& RHS) {
+    return (LHS == RHS) || (std::isnan(LHS) && std::isnan(RHS)) || (std::isinf(LHS) && std::isinf(RHS));
   }
 };
 

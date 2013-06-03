@@ -163,6 +163,7 @@ namespace {
       (void) llvm::createLoopVectorizePass();
       (void) llvm::createSLPVectorizerPass();
       (void) llvm::createBBVectorizePass();
+      (void) llvm::createBBVectorizeGlobalPass();
 
       (void)new llvm::IntervalPartition();
       (void)new llvm::FindUsedTypes();
