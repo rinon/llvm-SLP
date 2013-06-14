@@ -1148,8 +1148,8 @@ namespace {
                                               VPGraph &OriginalVarPackGraph,
                                               DenseSet<VPairWithWeight> &StatementGroupingEdges,
                                               DenseSet<ValuePair> &CandidatePairsSet) {
-    errs() << "Starting erase and recalculate\n";
-    errs() << "Statement grouping edge count (before): " << StatementGroupingEdges.size() << '\n';
+    // errs() << "Starting erase and recalculate\n";
+    // errs() << "Statement grouping edge count (before): " << StatementGroupingEdges.size() << '\n';
 
     for (DenseSet<VPairWithWeight>::iterator SGI = StatementGroupingEdges.begin(); SGI != StatementGroupingEdges.end(); ) {
       if (instructionsOverlap(SGI->first, ChosenPair)) {
@@ -1161,7 +1161,7 @@ namespace {
       }
     }
 
-    errs() << "Statement grouping edge count: " << StatementGroupingEdges.size() << '\n';
+    // errs() << "Statement grouping edge count: " << StatementGroupingEdges.size() << '\n';
 
     std::vector<VPPair> DeleteQueue;
     for (VPGraph::iterator VPI = VariablePackGraph.begin(); VPI != VariablePackGraph.end(); ++VPI) {
@@ -2526,10 +2526,10 @@ namespace {
 
 
     while (StatementGroupingEdges.size() > 0) {
-      errs() << "StatementGroupingEdges (" << StatementGroupingEdges.size() << "):\n";
-      for (DenseSet<VPairWithWeight>::iterator SGI = StatementGroupingEdges.begin(); SGI != StatementGroupingEdges.end(); ++SGI) {
-        errs() << '(' << *SGI->first.first << ',' << *SGI->first.second << ") : " << SGI->second << '\n';
-      }
+      // errs() << "StatementGroupingEdges (" << StatementGroupingEdges.size() << "):\n";
+      // for (DenseSet<VPairWithWeight>::iterator SGI = StatementGroupingEdges.begin(); SGI != StatementGroupingEdges.end(); ++SGI) {
+      //   errs() << '(' << *SGI->first.first << ',' << *SGI->first.second << ") : " << SGI->second << '\n';
+      // }
 
       double MaxWeight = -1;
       DenseSet<VPairWithWeight>::iterator MaxPair = StatementGroupingEdges.end();
@@ -2541,7 +2541,7 @@ namespace {
       }
       ValuePair ChosenPair(MaxPair->first.first, MaxPair->first.second);
       if (!(isa<InsertElementInst>(MaxPair->first.first) || isa<ExtractElementInst>(MaxPair->first.first))) {
-        errs() << "Pairing " << *ChosenPair.first << " " << *ChosenPair.second << '\n';
+        // errs() << "Pairing " << *ChosenPair.first << " " << *ChosenPair.second << '\n';
         ChosenPairs.insert(ValuePair(ChosenPair.first, ChosenPair.second));
       }
       eraseAndRecalculate(ChosenPair, VariablePackGraph, OriginalVarPackGraph, StatementGroupingEdges, CandidatePairsSet);
