@@ -1208,8 +1208,6 @@ namespace {
     for (BasicBlock::iterator I = Start++; I != E; ++I) {
       if (I == Start) IAfterStart = true;
 
-      errs() << "  " << *I << '\n';
-
       bool IsSimpleLoadStore;
       if (!isInstVectorizable(I, IsSimpleLoadStore)) continue;
 

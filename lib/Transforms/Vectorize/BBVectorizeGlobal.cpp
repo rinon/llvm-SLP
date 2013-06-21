@@ -2540,7 +2540,7 @@ namespace {
         }
       }
       ValuePair ChosenPair(MaxPair->first.first, MaxPair->first.second);
-      if (!(isa<InsertElementInst>(MaxPair->first.first) || isa<ExtractElementInst>(MaxPair->first.first))) {
+      if (!(isa<InsertElementInst>(MaxPair->first.first) || isa<ExtractElementInst>(MaxPair->first.first) || isa<ShuffleVectorInst>(MaxPair->first.first))) {
         // errs() << "Pairing " << *ChosenPair.first << " " << *ChosenPair.second << '\n';
         ChosenPairs.insert(ValuePair(ChosenPair.first, ChosenPair.second));
       }
