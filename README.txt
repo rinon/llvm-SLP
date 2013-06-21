@@ -16,3 +16,10 @@ documentation setup.
 If you're writing a package for LLVM, see docs/Packaging.rst for our
 suggestions.
 
+SLP Vectorizer Project
+======================
+
+This repository contains a preliminary implementation of a new
+Superword Level Parallelizer based on "A Compiler Framework for
+Extracting Superword Level Parallelism" by Liu et. al. (PLDI'12). See
+lib/Transforms/Vectorize/BBVectorizeGlobal.cpp for more details.
