@@ -410,6 +410,14 @@ namespace {
 
     void combineMetadata(Instruction *K, const Instruction *J);
 
+    bool CalculateCostEffectiveness(
+      DenseMap<Value *, Value *> &ChosenPairs,
+      DenseMap<ValuePair, int> &CandidatePairCostSavings,
+      DenseMap<VPPair, unsigned> &PairConnectionTypes,
+      DenseSet<ValuePair> &FixedOrderPairs,
+      DenseMap<ValuePair, std::vector<ValuePair> > &ConnectedPairDeps);
+
+
     bool vectorizeBB(BasicBlock &BB) {
       if (!DT->isReachableFromEntry(&BB)) {
         DEBUG(dbgs() << "BBV: skipping unreachable " << BB.getName() <<
@@ -2547,7 +2555,291 @@ namespace {
       eraseAndRecalculate(ChosenPair, VariablePackGraph, OriginalVarPackGraph, StatementGroupingEdges, CandidatePairsSet);
     }
 
+    bool IsCostEffective = CalculateCostEffectiveness(ChosenPairs, CandidatePairCostSavings, PairConnectionTypes, FixedOrderPairs, ConnectedPairDeps);
+
+    if (!IsCostEffective)
+      ChosenPairs.clear();
+
     DEBUG(dbgs() << "BBV: selected " << ChosenPairs.size() << " pairs.\n");
+  }
+
+  bool BBVectorizeGlobal::CalculateCostEffectiveness(
+                DenseMap<Value *, Value *> &ChosenPairs,
+                DenseMap<ValuePair, int> &CandidatePairCostSavings,
+                DenseMap<VPPair, unsigned> &PairConnectionTypes,
+                DenseSet<ValuePair> &FixedOrderPairs,
+                DenseMap<ValuePair, std::vector<ValuePair> > &ConnectedPairDeps) {
+
+    DenseSet<Value *> ChosenInstrs;
+    for (DenseMap<Value *, Value *>::iterator S = ChosenPairs.begin(),
+           E = ChosenPairs.end(); S != E; ++S) {
+      ChosenInstrs.insert(S->first);
+      ChosenInstrs.insert(S->second);
+    }
+
+    int Savings = 0;
+
+    // The set of pairs that have already contributed to the total cost.
+    DenseSet<ValuePair> IncomingPairs;
+
+    for (DenseMap<Value *, Value *>::iterator S = ChosenPairs.begin(),
+           IE = ChosenPairs.end(); S != IE; ++S) {
+      Savings += CandidatePairCostSavings.find(*S)->second;
+
+      bool FlipOrder = false;
+
+
+      // The edge weights contribute in a negative sense: they represent
+      // the cost of shuffles.
+      DenseMap<ValuePair, std::vector<ValuePair> >::iterator SS =
+        ConnectedPairDeps.find(*S);
+      if (SS != ConnectedPairDeps.end()) {
+        unsigned NumDepsDirect = 0, NumDepsSwap = 0;
+        for (std::vector<ValuePair>::iterator T = SS->second.begin(),
+               TE = SS->second.end(); T != TE; ++T) {
+          VPPair Q(*S, *T);
+          if (!ChosenPairs.count(Q.second.first))
+            continue;
+          DenseMap<VPPair, unsigned>::iterator R =
+            PairConnectionTypes.find(VPPair(Q.second, Q.first));
+          assert(R != PairConnectionTypes.end() &&
+                 "Cannot find pair connection type");
+          if (R->second == PairConnectionDirect)
+            ++NumDepsDirect;
+          else if (R->second == PairConnectionSwap)
+            ++NumDepsSwap;
+        }
+
+        // If there are more swaps than direct connections, then
+        // the pair order will be flipped during fusion. So the real
+        // number of swaps is the minimum number.
+        FlipOrder = !FixedOrderPairs.count(*S) &&
+          ((NumDepsSwap > NumDepsDirect) ||
+           FixedOrderPairs.count(ValuePair(S->second, S->first)));
+
+        for (std::vector<ValuePair>::iterator T = SS->second.begin(),
+               TE = SS->second.end(); T != TE; ++T) {
+          VPPair Q(*S, *T);
+          if (!ChosenPairs.count(Q.second.first))
+            continue;
+          DenseMap<VPPair, unsigned>::iterator R =
+            PairConnectionTypes.find(VPPair(Q.second, Q.first));
+          assert(R != PairConnectionTypes.end() &&
+                 "Cannot find pair connection type");
+          Type *Ty1 = Q.second.first->getType(),
+            *Ty2 = Q.second.second->getType();
+          Type *VTy = getVecTypeForPair(Ty1, Ty2);
+          if ((R->second == PairConnectionDirect && FlipOrder) ||
+              (R->second == PairConnectionSwap && !FlipOrder)  ||
+              R->second == PairConnectionSplat) {
+            int SavingsContrib = (int) getInstrCost(Instruction::ShuffleVector,
+                                               VTy, VTy);
+
+            if (VTy->getVectorNumElements() == 2) {
+              if (R->second == PairConnectionSplat)
+                SavingsContrib = std::min(SavingsContrib, (int) TTI->getShuffleCost(
+                                       TargetTransformInfo::SK_Broadcast, VTy));
+              else
+                SavingsContrib = std::min(SavingsContrib, (int) TTI->getShuffleCost(
+                                       TargetTransformInfo::SK_Reverse, VTy));
+            }
+
+            DEBUG(if (DebugPairSelection) dbgs() << "\tcost {" <<
+                                            *Q.second.first << " <-> " << *Q.second.second <<
+                                            "} -> {" <<
+                                            *S->first << " <-> " << *S->second << "} = " <<
+                                            SavingsContrib << "\n");
+            Savings -= SavingsContrib;
+          }
+        }
+      }
+
+      // Compute the cost of outgoing edges. We assume that edges outgoing
+      // to shuffles, inserts or extracts can be merged, and so contribute
+      // no additional cost.
+      if (!S->first->getType()->isVoidTy()) {
+        Type *Ty1 = S->first->getType(),
+          *Ty2 = S->second->getType();
+        Type *VTy = getVecTypeForPair(Ty1, Ty2);
+
+        bool NeedsExtraction = false;
+        for (Value::use_iterator I = S->first->use_begin(),
+               IE = S->first->use_end(); I != IE; ++I) {
+          if (ShuffleVectorInst *SI = dyn_cast<ShuffleVectorInst>(*I)) {
+            // Shuffle can be folded if it has no other input
+            if (isa<UndefValue>(SI->getOperand(1)))
+              continue;
+          }
+          if (isa<ExtractElementInst>(*I))
+            continue;
+          if (ChosenInstrs.count(*I))
+            continue;
+          NeedsExtraction = true;
+          break;
+        }
+
+        if (NeedsExtraction) {
+          int SavingsContrib;
+          if (Ty1->isVectorTy()) {
+            SavingsContrib = (int) getInstrCost(Instruction::ShuffleVector,
+                                           Ty1, VTy);
+            SavingsContrib = std::min(SavingsContrib, (int) TTI->getShuffleCost(
+                                   TargetTransformInfo::SK_ExtractSubvector, VTy, 0, Ty1));
+          } else
+            SavingsContrib = (int) TTI->getVectorInstrCost(
+              Instruction::ExtractElement, VTy, 0);
+
+          DEBUG(if (DebugPairSelection) dbgs() << "\tcost {" <<
+                                          *S->first << "} = " << SavingsContrib << "\n");
+          Savings -= SavingsContrib;
+        }
+
+        NeedsExtraction = false;
+        for (Value::use_iterator I = S->second->use_begin(),
+               IE = S->second->use_end(); I != IE; ++I) {
+          if (ShuffleVectorInst *SI = dyn_cast<ShuffleVectorInst>(*I)) {
+            // Shuffle can be folded if it has no other input
+            if (isa<UndefValue>(SI->getOperand(1)))
+              continue;
+          }
+          if (isa<ExtractElementInst>(*I))
+            continue;
+          if (ChosenInstrs.count(*I))
+            continue;
+          NeedsExtraction = true;
+          break;
+        }
+
+        if (NeedsExtraction) {
+          int SavingsContrib;
+          if (Ty2->isVectorTy()) {
+            SavingsContrib = (int) getInstrCost(Instruction::ShuffleVector,
+                                           Ty2, VTy);
+            SavingsContrib = std::min(SavingsContrib, (int) TTI->getShuffleCost(
+                                   TargetTransformInfo::SK_ExtractSubvector, VTy,
+                                   Ty1->isVectorTy() ? Ty1->getVectorNumElements() : 1, Ty2));
+          } else
+            SavingsContrib = (int) TTI->getVectorInstrCost(
+              Instruction::ExtractElement, VTy, 1);
+          DEBUG(if (DebugPairSelection) dbgs() << "\tcost {" <<
+                                          *S->second << "} = " << SavingsContrib << "\n");
+          Savings -= SavingsContrib;
+        }
+      }
+
+      // Compute the cost of incoming edges.
+      if (!isa<LoadInst>(S->first) && !isa<StoreInst>(S->first)) {
+        Instruction *S1 = cast<Instruction>(S->first),
+          *S2 = cast<Instruction>(S->second);
+        for (unsigned o = 0; o < S1->getNumOperands(); ++o) {
+          Value *O1 = S1->getOperand(o), *O2 = S2->getOperand(o);
+
+          // Combining constants into vector constants (or small vector
+          // constants into larger ones are assumed free).
+          if (isa<Constant>(O1) && isa<Constant>(O2))
+            continue;
+
+          if (FlipOrder)
+            std::swap(O1, O2);
+
+          ValuePair VP  = ValuePair(O1, O2);
+          ValuePair VPR = ValuePair(O2, O1);
+
+          // Internal edges are not handled here.
+          if (ChosenPairs.count(VP.first) || ChosenPairs.count(VPR.first))
+            continue;
+
+          Type *Ty1 = O1->getType(),
+            *Ty2 = O2->getType();
+          Type *VTy = getVecTypeForPair(Ty1, Ty2);
+
+          // Combining vector operations of the same type is also assumed
+          // folded with other operations.
+          if (Ty1 == Ty2) {
+            // If both are insert elements, then both can be widened.
+            InsertElementInst *IEO1 = dyn_cast<InsertElementInst>(O1),
+              *IEO2 = dyn_cast<InsertElementInst>(O2);
+            if (IEO1 && IEO2 && isPureIEChain(IEO1) && isPureIEChain(IEO2))
+              continue;
+            // If both are extract elements, and both have the same input
+            // type, then they can be replaced with a shuffle
+            ExtractElementInst *EIO1 = dyn_cast<ExtractElementInst>(O1),
+              *EIO2 = dyn_cast<ExtractElementInst>(O2);
+            if (EIO1 && EIO2 &&
+                EIO1->getOperand(0)->getType() ==
+                EIO2->getOperand(0)->getType())
+              continue;
+            // If both are a shuffle with equal operand types and only two
+            // unqiue operands, then they can be replaced with a single
+            // shuffle
+            ShuffleVectorInst *SIO1 = dyn_cast<ShuffleVectorInst>(O1),
+              *SIO2 = dyn_cast<ShuffleVectorInst>(O2);
+            if (SIO1 && SIO2 &&
+                SIO1->getOperand(0)->getType() ==
+                SIO2->getOperand(0)->getType()) {
+              SmallSet<Value *, 4> SIOps;
+              SIOps.insert(SIO1->getOperand(0));
+              SIOps.insert(SIO1->getOperand(1));
+              SIOps.insert(SIO2->getOperand(0));
+              SIOps.insert(SIO2->getOperand(1));
+              if (SIOps.size() <= 2)
+                continue;
+            }
+          }
+
+          int SavingsContrib;
+          // This pair has already been formed.
+          if (IncomingPairs.count(VP)) {
+            continue;
+          } else if (IncomingPairs.count(VPR)) {
+            SavingsContrib = (int) getInstrCost(Instruction::ShuffleVector,
+                                           VTy, VTy);
+
+            if (VTy->getVectorNumElements() == 2)
+              SavingsContrib = std::min(SavingsContrib, (int) TTI->getShuffleCost(
+                                     TargetTransformInfo::SK_Reverse, VTy));
+          } else if (!Ty1->isVectorTy() && !Ty2->isVectorTy()) {
+            SavingsContrib = (int) TTI->getVectorInstrCost(
+              Instruction::InsertElement, VTy, 0);
+            SavingsContrib += (int) TTI->getVectorInstrCost(
+              Instruction::InsertElement, VTy, 1);
+          } else if (!Ty1->isVectorTy()) {
+            // O1 needs to be inserted into a vector of size O2, and then
+            // both need to be shuffled together.
+            SavingsContrib = (int) TTI->getVectorInstrCost(
+              Instruction::InsertElement, Ty2, 0);
+            SavingsContrib += (int) getInstrCost(Instruction::ShuffleVector,
+                                            VTy, Ty2);
+          } else if (!Ty2->isVectorTy()) {
+            // O2 needs to be inserted into a vector of size O1, and then
+            // both need to be shuffled together.
+            SavingsContrib = (int) TTI->getVectorInstrCost(
+              Instruction::InsertElement, Ty1, 0);
+            SavingsContrib += (int) getInstrCost(Instruction::ShuffleVector,
+                                            VTy, Ty1);
+          } else {
+            Type *TyBig = Ty1, *TySmall = Ty2;
+            if (Ty2->getVectorNumElements() > Ty1->getVectorNumElements())
+              std::swap(TyBig, TySmall);
+
+            SavingsContrib = (int) getInstrCost(Instruction::ShuffleVector,
+                                           VTy, TyBig);
+            if (TyBig != TySmall)
+              SavingsContrib += (int) getInstrCost(Instruction::ShuffleVector,
+                                              TyBig, TySmall);
+          }
+
+          DEBUG(if (DebugPairSelection) dbgs() << "\tcost {"
+                                               << *O1 << " <-> " << *O2 << "} = " <<
+                                          SavingsContrib << "\n");
+          Savings -= SavingsContrib;
+          IncomingPairs.insert(VP);
+        }
+      }
+    }
+
+    DEBUG(if (DebugPairSelection) dbgs() << "Total cost savings:" << Savings << "\n");
+    return Savings > 0;
   }
 
   std::string getReplacementName(Instruction *I, bool IsInput, unsigned o,
