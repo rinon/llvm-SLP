@@ -23,3 +23,5 @@ This repository contains a preliminary implementation of a new
 Superword Level Parallelizer based on "A Compiler Framework for
 Extracting Superword Level Parallelism" by Liu et. al. (PLDI'12). See
 lib/Transforms/Vectorize/BBVectorizeGlobal.cpp for more details.
+
+Clang sources available at: https://github.com/rinon/llvm-SLP-clang
